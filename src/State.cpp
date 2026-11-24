@@ -41,19 +41,22 @@ void State::setMode(Mode mode) { this->mode = mode; }
 Mode State::changeMode() {
     switch (getMode()) {
     case Mode::GAME:
-        setMode(Mode::LED);
+        mode = Mode::LED;
         break;
     case Mode::LED:
-        setMode(Mode::LED_INDVD);
+        mode = Mode::LED_INDVD;
         break;
     case Mode::LED_INDVD:
-        setMode(Mode::SHOW);
+        mode = Mode::SHOW;
         break;
     case Mode::SHOW:
-        setMode(Mode::SERVO);
+        mode = Mode::SERVO;
         break;
     case Mode::SERVO:
-        setMode(Mode::GAME);
+        mode = Mode::SERVO_ENC;
+        break;
+    case Mode::SERVO_ENC:
+        mode = Mode::GAME;
         break;
     default:
         break;
@@ -202,3 +205,11 @@ void State::resetFlags() {
 int State::getBlinkRate() const { return blinkRate; }
 
 void State::setBlinkRate(int blinkRate) { this->blinkRate = blinkRate; }
+
+int State::getEncoderSteps() { return encoderSteps; }
+
+void State::setEncoderSteps(int step) {
+    if (step <= 20 && step >= 0) {
+        encoderSteps = step;
+    }
+}

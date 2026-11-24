@@ -1,50 +1,54 @@
 #include <Ethernet.h>
-#include <Game.h>
-#include <LedUtil.h>
-#include <Mode.h>
+#include <EthernetUdp.h>
+#include <HardwareConfig.h>
 #include <RTClib.h>
-#include <SPI.h>
 #include <Servo.h>
 #include <SevenSegmentDisplay.h>
 #include <State.h>
+#include <TM1637Plus.h>
+#include <TM1638Plus.h>
+#include <Type.h>
 #include <Wire.h>
 
-const byte DIO_4DIG = A0;
-const byte CLK_4DIG = A1;
+const uint8_t DIO_4DIG = HardwareConfig::DIO_4DIG;
+const uint8_t CLK_4DIG = HardwareConfig::CLK_4DIG;
+const uint8_t STB_LK = HardwareConfig::STB_LK;
+const uint8_t CLK_LK = HardwareConfig::CLK_LK;
+const uint8_t DIO_LK = HardwareConfig::DIO_LK;
+const uint8_t SERVO_PIN = HardwareConfig::SERVO_PIN;
+const uint8_t SW_ENC = HardwareConfig::SW_ENC;
+const uint8_t DT_ENC = HardwareConfig::DT_ENC;
+const uint8_t CLK_ENC = HardwareConfig::CLK_ENC;
 
-const byte STB_LK = 10;
-const byte CLK_LK = 9;
-const byte DIO_LK = 8;
-const byte WHITE_LED = 6;
-const byte SERVO_PIN = 5;
-const byte SW_ENC = 4;
-const byte DT_ENC = 3;
-const byte CLK_ENC = 2;
+const uint16_t UDP_PORT = 8888;
+const uint16_t SERVER_PORT = 8889;
 
-const int LED_SIZE = 8;
-const int BUTTONS_SIZE = 8;
+const IPAddress SERVER_IP(192, 168, 70, 16);
+
+const int UPD_TIME = 10000;
+const int LED_SIZE = 0;
+const int BUTTONS_SIZE = 0;
 const int DISPLAYS_AMOUNT = 3;
 const int DISPLAYS_DIGIT_AMOUNT = 4;
+const int RECONNECT_TIMEOUT = 5000;
 
 TM1638plus lk(STB_LK, CLK_LK, DIO_LK, false);
 TM1637plus_modelX display4dig(CLK_4DIG, DIO_4DIG, 100, 4);
 RTC_DS3231 rtc;
 Servo servo;
 
+uint8_t displayBrightness = 7;
+uint8_t encHalfStep = 0;
+uint8_t servoAngle = 0;
+
 byte lastSW;
 byte lastCLK;
-byte buttonsMask = 0;
-byte prevButtonsMask = 0;
-byte difficulty = 4;
-byte displayBrightness = 7;
-
-uint8_t servoAngle = 0;
 
 byte mac[] = {0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED};
 
-bool leds[LED_SIZE] = {false};
-
 char currentTimeString[5];
+
+bool isConnected = false;
 
 int encPos = 0;
 int prevEncPos = 0;
@@ -56,19 +60,19 @@ unsigned long prevBlinkTime = 0;
 unsigned long lastTimeUpdate = 0;
 unsigned long timeSec = 0;
 unsigned long currentTime = 0;
+unsigned long lastReconnectTime = 0;
+unsigned long lastUpdateTime = 0;
 
-volatile Mode mode = Mode::GAME;
+volatile Mode mode = Mode::SERVO;
 
 State state =
     State(mode, LED_SIZE, BUTTONS_SIZE, DISPLAYS_AMOUNT, DISPLAYS_DIGIT_AMOUNT, servoAngle, encPos);
 
-LedUtil ledUtil = LedUtil();
-Game game = Game(score, difficulty, Lane::BOTTOM, GameState::READY, lk, display4dig);
-
 EthernetServer server(80);
+EthernetUDP udp;
 
-void setDisplayChar(uint8_t displayIndexI, uint8_t displayIndexJ, char character) {
-    state.setDisplay(displayIndexI, displayIndexJ, SevenSegmentDisplay().toByte(character));
+void setDisplayChar(uint8_t displayIndex, uint8_t digitIndex, char character) {
+    state.setDisplay(displayIndex, digitIndex, SevenSegmentDisplay().toByte(character));
 }
 
 void setDisplayChar(uint8_t displayIndexI, int number) {
@@ -80,9 +84,9 @@ void setDisplayChar(uint8_t displayIndexI, int number) {
     }
 }
 
-void setDisplayChar(uint8_t displayIndexI, char arr[4]) {
+void setDisplayChar(uint8_t displayIndex, char arr[4]) {
     for (int i = 3; i >= 0; i--) {
-        setDisplayChar(displayIndexI, i, arr[i]);
+        setDisplayChar(displayIndex, i, arr[i]);
     }
 }
 
@@ -103,26 +107,6 @@ void updateCurrentTimeString(char *currentTimeString) {
     sprintf(currentTimeString, "%02d%02d", now.hour(), now.minute());
 }
 
-void changeDisplayBrightness() {
-    lk.brightness(displayBrightness++);
-    displayBrightness = displayBrightness > 7 ? 0 : displayBrightness;
-}
-
-void updateLeds() {
-    for (byte i = 0; i < state.getLedsSize(); i++) {
-        lk.setLED(i, state.getLed(i));
-    }
-}
-
-byte getBitIndex(unsigned char mask) {
-    for (byte i = 0; i < 8; i++) {
-        if ((mask >> i) & 1) {
-            return i;
-        }
-    }
-    return -1;
-}
-
 void readEncPos() {
     byte currentCLK = digitalRead(CLK_ENC);
     if (lastCLK == HIGH && currentCLK == LOW) {
@@ -131,9 +115,11 @@ void readEncPos() {
 
         if (digitalRead(DT_ENC) != currentCLK) {
             state.setEncoderPosition(state.getEncoderPosition() + 1);
+            state.setEncoderSteps(state.getEncoderSteps() + 1);
             updateServoAngle(true, false);
         } else {
             state.setEncoderPosition(state.getEncoderPosition() - 1);
+            state.setEncoderSteps(state.getEncoderSteps() - 1);
             updateServoAngle(false, true);
         }
     }
@@ -146,17 +132,12 @@ bool readEncPress() {
 
     if (lastSW == HIGH && currentSW == LOW) {
         state.changeMode();
+        Serial.println(static_cast<int>(state.getMode()));
         isPressed = true;
     }
 
     lastSW = currentSW;
     return isPressed;
-}
-
-void initGameDifficultyLeds() {
-    for (int i = 0; i < state.getLedsSize(); i++) {
-        state.setLed(i, i < game.getDifficulty());
-    }
 }
 
 void rotateServo(byte angle) {
@@ -168,229 +149,83 @@ void rotateServo(byte angle) {
 void readEncoder() {
     readEncPos();
     readEncPress();
-    rotateServo(state.getServoAngle());
 }
 
-void updateState() { updateLeds(); }
+bool checkWrittenBounds(unsigned int written, size_t bufferSize, size_t pos) {
+    return written < 0 || written >= bufferSize - pos;
+}
 
-void switchMode(int btnNum) {
-    state.resetFlags();
+uint8_t getEncMappedServoAngle(uint8_t encStep) { return map(encStep, 0, 20, 0, 180); }
 
-    switch (state.getMode()) {
-    case Mode::GAME:
-        switch (btnNum) {
-        case 0:
-            blinkRate = 0;
-            game.start();
+bool findJsonValue(const char *json, const char *key, const char *&pos) {
+    char keyPattern[20];
 
-            initGameDifficultyLeds();
-            break;
+    snprintf(keyPattern, sizeof(keyPattern), "\"%s\"", key);
 
-        case 1:
-            game.setGameState(GameState::PAUSE);
-            break;
+    pos = strstr(json, keyPattern);
 
-        case 2:
-            break;
-
-        case 3:
-            game.reset();
-            lk.reset();
-            break;
-
-        case 4:
-            break;
-
-        case 5:
-            break;
-
-        case 6:
-            blinkRate = 0;
-            game.setDifficulty(game.getDifficulty() - 1);
-            initGameDifficultyLeds();
-            break;
-
-        case 7:
-            blinkRate = 0;
-            game.setDifficulty(game.getDifficulty() + 1);
-            initGameDifficultyLeds();
-            break;
-
-        default:
-            break;
-        }
-        break;
-
-    case Mode::LED:
-        switch (btnNum) {
-        case 0:
-            state.setBlinkFlag(!state.getBlinkFlag());
-            break;
-
-        case 1:
-            blinkRate += 25;
-            blinkRate = blinkRate > __LONG_MAX__ ? __LONG_MAX__ : blinkRate;
-            break;
-
-        case 2:
-            blinkRate -= 25;
-            blinkRate = blinkRate > __LONG_MAX__ ? 0 : blinkRate;
-            break;
-
-        case 3:
-            changeDisplayBrightness();
-            break;
-
-        case 4:
-            break;
-
-        case 5:
-            ledUtil.evenFlip(leds, state.getLedsSize());
-            state.setLeds(leds);
-            break;
-
-        case 6:
-            ledUtil.oddFlip(leds, state.getLedsSize());
-            state.setLeds(leds);
-            break;
-
-        case 7:
-            ledUtil.flip(leds, state.getLedsSize());
-            state.setLeds(leds);
-            break;
-
-        default:
-            break;
-        }
-        break;
-
-    case Mode::LED_INDVD:
-        switch (btnNum) {
-        case 0:
-        case 1:
-        case 2:
-        case 3:
-        case 4:
-        case 5:
-        case 6:
-        case 7:
-            state.setLed(btnNum, !state.getLed(btnNum));
-            break;
-
-        default:
-            break;
-        }
-        break;
-
-    case Mode::SHOW:
-        switch (btnNum) {
-        case 0:
-            state.resetFlags();
-            state.setShowTimeFlag(!state.getShowTimeFlag());
-
-            lk.reset();
-            break;
-
-        case 1:
-            state.resetFlags();
-            state.setShowEncPosFlag(!state.getShowEncPosFlag());
-
-            lk.reset();
-            break;
-
-        case 2:
-            break;
-
-        case 3:
-            lk.reset();
-            break;
-
-        case 4:
-            lk.display7Seg(4, Obstacle(Lane::BOTTOM).getBinaryValue());
-            break;
-
-        case 5:
-            lk.display7Seg(5, Obstacle(Lane::MIDDLE).getBinaryValue());
-            break;
-
-        case 6:
-            lk.display7Seg(6, Obstacle(Lane::TOP).getBinaryValue());
-            break;
-
-        case 7:
-            lk.display7Seg(7, Obstacle(game.getRandLane()).getBinaryValue());
-            break;
-
-        default:
-            break;
-        }
-        break;
-
-    case Mode::SERVO:
-        switch (btnNum) {
-        case 0:
-            state.resetFlags();
-            state.setServoRotateFlag(!state.getServoRotateFlag());
-            state.setShowServoRotateAngle(!state.getShowServoRotateAngle());
-
-            lk.reset();
-            break;
-
-        case 1:
-            break;
-
-        case 2:
-            break;
-
-        case 3:
-            break;
-
-        case 4:
-            break;
-
-        case 5:
-            break;
-
-        case 6:
-            break;
-
-        case 7:
-            break;
-
-        default:
-            break;
-        }
-        break;
-
-    default:
-        break;
+    if (pos == nullptr) {
+        return false;
     }
+
+    pos = strchr(pos, ':');
+
+    if (pos == nullptr) {
+        return false;
+    }
+
+    pos++;
+
+    while (*pos == ' ' || *pos == '\t') {
+        pos++;
+    }
+
+    return true;
+}
+
+bool getJsonVal(const char *json, const char *key, bool &result) {
+    const char *pos;
+
+    if (!findJsonValue(json, key, pos)) {
+        return false;
+    }
+
+    if (strncmp(pos, "true", 4) == 0) {
+        result = true;
+        return true;
+    }
+
+    if (strncmp(pos, "false", 5) == 0) {
+        result = false;
+        return true;
+    }
+
+    return false;
+}
+
+bool getJsonVal(const char *json, const char *key, int &result) {
+    const char *pos;
+    char *end;
+
+    if (!findJsonValue(json, key, pos)) {
+        return false;
+    }
+
+    long value = strtol(pos, &end, 10);
+
+    if (end == pos || value < -32768 || value > 32767) {
+        return false;
+    }
+
+    result = (int)value;
+
+    return true;
 }
 
 bool getStateJson(char *buffer, size_t bufferSize) {
     size_t pos = 0;
 
-    unsigned int written =
-        snprintf(buffer, bufferSize, "{\"mode\":%u,\"leds\":[", static_cast<int>(state.getMode()));
-
-    if (written < 0 || written >= bufferSize) {
-        return false;
-    }
-
-    pos += written;
-
-    for (uint8_t i = 0; i < LED_SIZE; i++) {
-        written = snprintf(buffer + pos, bufferSize - pos, "%s%s", i > 0 ? "," : "",
-                           state.getLed(i) ? "true" : "false");
-
-        if (written < 0 || written >= bufferSize - pos) {
-            return false;
-        }
-
-        pos += written;
-    }
-
-    written = snprintf(buffer + pos, bufferSize - pos, "],\"displays\":[");
+    unsigned int written = snprintf(buffer + pos, bufferSize - pos, "{\"displays\":[");
 
     pos += written;
 
@@ -410,7 +245,7 @@ bool getStateJson(char *buffer, size_t bufferSize) {
 
     written = snprintf(buffer + pos, bufferSize - pos, "],");
 
-    if (written < 0 || written >= bufferSize - pos) {
+    if (checkWrittenBounds(written, bufferSize, pos)) {
         return false;
     }
 
@@ -419,88 +254,109 @@ bool getStateJson(char *buffer, size_t bufferSize) {
     written =
         snprintf(buffer + pos, bufferSize - pos, "\"encoder\":%d}", state.getEncoderPosition());
 
-    if (written < 0 || written >= bufferSize - pos) {
+    if (checkWrittenBounds(written, bufferSize, pos)) {
         return false;
     }
 
     return true;
 }
 
-void handleHttpClient() {
-    EthernetClient client = server.available();
-
-    if (!client) {
-        return;
+bool setStateJson(char *buffer, size_t bufferSize) {
+    if (buffer == nullptr || bufferSize == 0) {
+        return false;
     }
 
-    IPAddress remoteIP = client.remoteIP();
-    uint16_t remotePort = client.remotePort();
+    const char *type = strstr(buffer, "\"type\"");
 
-    if (remoteIP == IPAddress(0, 0, 0, 0) || remotePort == 0) {
-        client.stop();
-        return;
+    if (type == nullptr) {
+        return false;
     }
 
-    char request[100] = {0};
-    uint8_t index = 0;
-    bool firstLineDone = false;
+    type = strchr(type, ':');
 
-    unsigned long startTime = millis();
+    if (type == nullptr) {
+        return false;
+    }
 
-    while (client.connected() && millis() - startTime < 500) {
-        while (client.available()) {
-            char c = client.read();
+    type++;
 
-            if (c == '\n') {
-                request[index] = '\0';
-                firstLineDone = true;
-                break;
-            }
+    while (*type == ' ' || *type == '\t') {
+        type++;
+    }
 
-            if (c != '\r' && index < sizeof(request) - 1) {
-                request[index++] = c;
-            }
+    if (*type != '"') {
+        return false;
+    }
+
+    type++;
+
+    Type switchType = Type::UNKNOWN;
+    if (strncmp(type, "encoder", 7) == 0 && type[7] == '"') {
+        switchType = Type::ENCODER;
+    } else if (strncmp(type, "led", 3) == 0 && type[3] == '"') {
+        switchType = Type::LED;
+    } else if (strncmp(type, "button", 6) == 0 && type[6] == '"') {
+        switchType = Type::BUTTON;
+    }
+
+    Serial.println(static_cast<int>(switchType));
+
+    switch (switchType) {
+    case Type::ENCODER: {
+        int value;
+        int delta;
+
+        if (!getJsonVal(buffer, "value", value)) {
+            return false;
+        }
+        if (!getJsonVal(buffer, "delta", delta)) {
+            return false;
+        }
+        state.setEncoderPosition(value);
+        state.setEncoderSteps(state.getEncoderSteps() + delta);
+
+        int newAngle = (int)servoAngle + delta;
+
+        newAngle = constrain(newAngle, 0, 180);
+
+        servoAngle = (uint8_t)newAngle;
+        state.setEncMoveFlag(true);
+        state.setServoAngle(servoAngle);
+    } break;
+
+    case Type::LED: {
+        int ledIndex;
+        bool ledValue;
+
+        if (!getJsonVal(buffer, "index", ledIndex)) {
+            return false;
         }
 
-        if (firstLineDone) {
-            break;
+        if (!getJsonVal(buffer, "value", ledValue)) {
+            return false;
         }
+
+    } break;
+
+    case Type::BUTTON:
+        break;
+
+    case Type::UNKNOWN:
+        break;
+
+    default:
+        return false;
     }
 
-    if (!firstLineDone) {
-        client.stop();
-        return;
-    }
-
-    if (strncmp(request, "GET /api/state", 14) == 0) {
-        char response[135];
-        getStateJson(response, sizeof(response));
-
-        client.println(F("HTTP/1.1 200 OK"));
-        client.println(F("Content-Type: application/json"));
-        client.println(F("Access-Control-Allow-Origin: *"));
-        client.println(F("Connection: close"));
-        client.print(F("Content-Length: "));
-        client.println(strlen(response));
-
-        client.println();
-        client.print(response);
-    } else {
-        client.println(F("HTTP/1.1 404 Not Found"));
-        client.println(F("Access-Control-Allow-Origin: *"));
-        client.println(F("Connection: close"));
-        client.println();
-    }
-
-    client.stop();
+    return true;
 }
 
 void initServer() {
     if (Ethernet.begin(mac) == 0) {
-        Serial.println(F("DHCP failed!"));
-        while (true) {
-            ;
-        }
+        Serial.println(F("DHCP failed! Manual encoder rotate only."));
+    } else {
+        Serial.println(F("DHCP initialized!"));
+        isConnected = true;
     }
 
     Serial.println(Ethernet.localIP());
@@ -508,6 +364,36 @@ void initServer() {
     server.begin();
 
     Serial.println(F("HTTP server started!"));
+
+    if (udp.begin(UDP_PORT)) {
+        Serial.println(F("UDP server started"));
+        Serial.print(F("Listening on port: "));
+        Serial.println(UDP_PORT);
+    } else {
+        Serial.println(F("UDP initialization failed"));
+    }
+}
+
+void handleUdp() {
+    int packetSize = udp.parsePacket();
+
+    if (packetSize <= 0) {
+        return;
+    }
+
+    char buffer[200];
+    int len = udp.read(buffer, sizeof(buffer) - 1);
+
+    if (len <= 0) {
+        return;
+    }
+
+    buffer[len] = '\0';
+
+    Serial.print(F("Message: "));
+    Serial.println(buffer);
+
+    setStateJson(buffer, sizeof(buffer));
 }
 
 void setup() {
@@ -529,14 +415,9 @@ void setup() {
     servo.attach(SERVO_PIN);
     rotateServo(0);
 
-    analogWrite(WHITE_LED, 255);
-
     Wire.begin();
 
-    if (!rtc.begin()) {
-        while (true)
-            ;
-    }
+    rtc.begin();
 
     if (rtc.lostPower()) {
         rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
@@ -544,59 +425,54 @@ void setup() {
 
     srand(rtc.now().secondstime());
 
+    state.setServoRotateFlag(true);
     initServer();
+}
+
+void sendStateUDP() {
+    char buffer[200];
+
+    if (!getStateJson(buffer, sizeof(buffer))) {
+        return;
+    }
+
+    udp.beginPacket(SERVER_IP, SERVER_PORT);
+    udp.write((const uint8_t *)buffer, strlen(buffer));
+
+    udp.endPacket();
+    Serial.println(buffer);
 }
 
 void loop() {
     currentTime = millis();
     timeSec = currentTime / 1000;
-    buttonsMask = lk.readButtons();
+    readEncPress();
 
-    if (readEncPress()) {
-        if (game.getGameState() == GameState::PLAYING) {
-            game.setGameState(GameState::PAUSE);
+    if (!isConnected && currentTime - lastTimeUpdate > RECONNECT_TIMEOUT) {
+        lastReconnectTime = currentTime;
+        initServer();
+    }
+
+    if (state.getEncMoveFlag()) {
+        uint8_t angle = 0;
+        if (state.getMode() == Mode::SERVO) {
+            lk.displayIntNum(servoAngle, false, TMAlignTextRight);
+            setDisplayChar(1, servoAngle);
+            angle = servoAngle;
         }
-        switchMode(-1);
-    } else if (currentTime - lastPress > 100 && buttonsMask != 0 && prevButtonsMask == 0) {
-        lastPress = currentTime;
-        byte btnNum = getBitIndex(buttonsMask);
-        switchMode(btnNum);
-    }
 
-    prevButtonsMask = buttonsMask;
+        if (state.getMode() == Mode::SERVO_ENC) {
+            angle = getEncMappedServoAngle(state.getEncoderSteps());
+            lk.displayIntNum(angle, false, TMAlignTextRight);
+            setDisplayChar(1, angle);
+        }
 
-    if (state.getShowTimeFlag()) {
-        lk.displayIntNum(timeSec, false, TMAlignTextRight);
-        setDisplayChar(1, timeSec);
-    }
-
-    if (state.getShowEncPosFlag()) {
-        lk.displayIntNum(state.getEncoderPosition(), false, TMAlignTextRight);
-        setDisplayChar(1, state.getEncoderPosition());
-    }
-
-    if (state.getMode() == Mode::SERVO && state.getShowServoRotateAngle() &&
-        state.getEncMoveFlag()) {
-
-        lk.displayIntNum(servoAngle, false, TMAlignTextRight);
-        setDisplayChar(1, servoAngle);
-        rotateServo(servoAngle);
+        rotateServo(angle);
+        sendStateUDP();
         state.setEncMoveFlag(false);
     }
 
-    if (state.getMode() == Mode::LED) {
-        analogWrite(WHITE_LED, map(state.getEncoderPosition() * 10, 0, 1000, 255, 0));
-    }
-
-    if (state.getMode() == Mode::GAME && game.getGameState() == GameState::PLAYING &&
-        state.getEncoderPosition() != prevEncPos && state.getEncMoveFlag()) {
-        prevEncPos < state.getEncoderPosition() ? game.moveUp() : game.moveDown();
-        state.setEncMoveFlag(false);
-    }
-
-    game.update(currentTime);
-
-    if (game.getGameState() == GameState::READY && currentTime - lastTimeUpdate > 1000) {
+    if (currentTime - lastTimeUpdate > 1000) {
         lastTimeUpdate = currentTime;
         updateCurrentTimeString(currentTimeString);
         state.setShowDisplaySemicolon(timeSec % 2);
@@ -607,12 +483,10 @@ void loop() {
                                   0);
     }
 
-    if (state.getBlinkFlag() && currentTime - prevBlinkTime > blinkRate && blinkRate > 0) {
-        ledUtil.flip(leds, state.getLedsSize());
-        state.setLeds(leds);
-        prevBlinkTime = currentTime;
+    if (currentTime - lastUpdateTime > UPD_TIME) {
+        sendStateUDP();
+        lastUpdateTime = currentTime;
     }
 
-    updateState();
-    handleHttpClient();
+    handleUdp();
 }

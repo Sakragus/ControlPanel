@@ -30,6 +30,8 @@ class State {
 
     uint8_t servoAngle;
 
+    uint8_t encoderSteps;
+
   public:
     State(Mode mode, int ledsSize, int buttonsSize, int displaysAmount, int displayDigitAmount,
           uint8_t servoAngle, int encoderPosition);
@@ -117,4 +119,9 @@ class State {
     int getBlinkRate() const;
 
     void setBlinkRate(int blinkRate);
+
+    int getEncoderSteps();
+
+    // max 20 min 0
+    void setEncoderSteps(int step);
 };
